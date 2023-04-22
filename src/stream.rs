@@ -1,11 +1,11 @@
+use crate::subscription::AudioInterfaceEvent;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, FromSample, Host, Sample, SizedSample, Stream, SupportedStreamConfig,
+    FromSample, Sample, SizedSample, Stream, SupportedStreamConfig,
 };
 use crossbeam::queue::ArrayQueue;
 use crossbeam_channel::Sender;
-use std::result::Result::Ok;
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, result::Result::Ok, sync::Arc};
 
 #[derive(Debug, Default)]
 pub struct StereoSample {
@@ -13,38 +13,31 @@ pub struct StereoSample {
     pub right: f32,
 }
 
+/// The producer-consumer queue of stereo samples that the audio stream consumes.
 pub type AudioQueue = Arc<ArrayQueue<StereoSample>>;
-
-/// Describes the audio interface.
-struct StreamInfo {
-    #[allow(dead_code)]
-    host: Host,
-    #[allow(dead_code)]
-    device: Device,
-    config: SupportedStreamConfig,
-}
-impl Debug for StreamInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AudioStream")
-            .field("host", &"(skipped)")
-            .field("device", &"(skipped)")
-            .field("config", &self.config)
-            .finish()
-    }
-}
 
 /// Encapsulates the connection to the audio interface.
 pub struct AudioStream {
-    stream_info: StreamInfo,
+    // cpal config describing the current audio stream.
+    config: SupportedStreamConfig,
+
+    // The cpal audio stream.
     stream: Stream,
+
+    // The queue of samples that the stream consumes.
     queue: AudioQueue,
+
+    // The sending half of the channel that the audio stream uses to send
+    // updates to the subscription.
+    sender: Sender<AudioInterfaceEvent>,
 }
 impl Debug for AudioStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AudioStream")
-            .field("stream_info", &self.stream_info)
+            .field("config", &"(skipped)")
             .field("stream", &"(skipped)")
             .field("queue", &self.queue)
+            .field("sender", &self.sender)
             .finish()
     }
 }
@@ -62,25 +55,23 @@ impl AudioStream {
 
     pub fn create_default_stream(
         buffer_size: usize,
-        needs_more_data_sender: Sender<bool>,
+        audio_stream_event_sender: Sender<AudioInterfaceEvent>,
     ) -> Result<Self, ()> {
-        if let Ok((host, device, config)) = Self::host_device_setup() {
+        if let Ok((_host, device, config)) = Self::host_device_setup() {
             let queue = Arc::new(ArrayQueue::new(buffer_size));
             if let Ok(stream) = Self::stream_setup_for(
                 &device,
                 &config,
                 &Arc::clone(&queue),
-                needs_more_data_sender,
+                audio_stream_event_sender.clone(),
             ) {
                 let r = Self {
-                    stream_info: StreamInfo {
-                        host,
-                        device,
-                        config,
-                    },
+                    config,
                     stream,
                     queue,
+                    sender: audio_stream_event_sender,
                 };
+                r.send_reset();
                 Ok(r)
             } else {
                 Err(())
@@ -92,17 +83,8 @@ impl AudioStream {
 
     /// Returns the sample rate of the current audio stream.
     pub fn sample_rate(&self) -> usize {
-        let config: &cpal::StreamConfig = &self.stream_info.config.clone().into();
+        let config: &cpal::StreamConfig = &self.config.clone().into();
         config.sample_rate.0 as usize
-    }
-
-    /// Returns the ArrayQueue<f32> that the audio stream consumes. Each item is
-    /// a sample for one channel. For stereo streams, the channels are
-    /// interleaved. That means that the first f32 is for the left channel of
-    /// sample #0, the second f32 is for the right channel of sample #0, and so
-    /// on.
-    pub fn queue(&self) -> &AudioQueue {
-        &self.queue
     }
 
     /// Tells the audio stream to stop playing audio (which means it will also
@@ -115,6 +97,11 @@ impl AudioStream {
     /// from the queue).
     pub fn pause(&self) {
         let _ = self.stream.pause();
+    }
+
+    /// Gives the audio stream a chance to clean up before the thread exits.
+    pub fn quit(&mut self) {
+        let _ = self.sender.send(AudioInterfaceEvent::Quit);
     }
 
     /// Returns the default host, device, and stream config (all of which are
@@ -142,7 +129,7 @@ impl AudioStream {
         device: &cpal::Device,
         config: &SupportedStreamConfig,
         queue: &AudioQueue,
-        needs_more_data_sender: Sender<bool>,
+        audio_stream_event_sender: Sender<AudioInterfaceEvent>,
     ) -> anyhow::Result<Stream, anyhow::Error> {
         let config = config.clone();
 
@@ -156,7 +143,7 @@ impl AudioStream {
             cpal::SampleFormat::U32 => todo!(),
             cpal::SampleFormat::U64 => todo!(),
             cpal::SampleFormat::F32 => {
-                Self::stream_make::<f32>(&config.into(), &device, queue, needs_more_data_sender)
+                Self::stream_make::<f32>(&config.into(), &device, queue, audio_stream_event_sender)
             }
             cpal::SampleFormat::F64 => todo!(),
             _ => todo!(),
@@ -168,7 +155,7 @@ impl AudioStream {
         config: &cpal::StreamConfig,
         device: &cpal::Device,
         queue: &AudioQueue,
-        needs_more_data_sender: Sender<bool>,
+        audio_stream_event_sender: Sender<AudioInterfaceEvent>,
     ) -> Result<Stream, anyhow::Error>
     where
         T: SizedSample + FromSample<f32>,
@@ -184,7 +171,7 @@ impl AudioStream {
                     output,
                     channel_count,
                     &queue,
-                    needs_more_data_sender.clone(),
+                    audio_stream_event_sender.clone(),
                 )
             },
             err_fn,
@@ -199,11 +186,10 @@ impl AudioStream {
         output: &mut [T],
         channel_count: usize,
         queue: &AudioQueue,
-        needs_more_data_sender: Sender<bool>,
+        audio_stream_event_sender: Sender<AudioInterfaceEvent>,
     ) where
         T: Sample + FromSample<f32>,
     {
-        eprintln!("output length {}", output.len());
         for frame in output.chunks_exact_mut(channel_count) {
             let sample = queue.pop().unwrap_or_default();
             frame[0] = T::from_sample(sample.left);
@@ -211,6 +197,17 @@ impl AudioStream {
                 frame[1] = T::from_sample(sample.right);
             }
         }
-        let _ = needs_more_data_sender.send(true);
+        let capacity = queue.capacity();
+        let len = queue.len();
+        if len < capacity {
+            let _ = audio_stream_event_sender.send(AudioInterfaceEvent::NeedsAudio(capacity - len));
+        }
+    }
+
+    fn send_reset(&self) {
+        let _ = self.sender.send(AudioInterfaceEvent::Reset(
+            self.sample_rate(),
+            Arc::clone(&self.queue),
+        ));
     }
 }
