@@ -12,13 +12,13 @@
 //! [AudioInterfaceSubscription] as an Iced subscription. The subscription lets
 //! the app know when it needs more data to feed to the audio interface, which
 //! the app asks [Synthesizer] to provide through the crossbeam ArrayQueue.
-//! 
+//!
 //! The subscription accepts various input. It can play and pause the stream,
 //! which controls whether the audio interface consumes samples from the queue.
 //! The app can play and pause [Synthesizer] as well, controlling whether it
 //! produces samples for the queue, and it can change the frequency of the
 //! synthesized tone.
-//! 
+//!
 //! Now that the interface is nicely encapsulated as a subscription, I'm going
 //! to try turning [Synthesizer] into something that demands more computing
 //! resources to force the issue of async and/or threading.
@@ -30,7 +30,7 @@ use iced::{
     window, Application, Command, Event, Settings, Subscription, Theme,
 };
 use iced_aw::Card;
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Instant};
 use stream::AudioQueue;
 use subscription::{AudioInterfaceEvent, AudioInterfaceInput};
 use synthesizer::Synthesizer;
@@ -43,16 +43,18 @@ mod synthesizer;
 enum Message {
     AudioInterface(AudioInterfaceEvent),
     Event(iced::Event),
-    GeneratorChangeFrequency,
-    GeneratorPause,
-    GeneratorPlay,
+    SourceChangeFrequency,
+    SourceDecreaseDelay,
+    SourceIncreaseDelay,
+    SourcePause,
+    SourcePlay,
     StreamPause,
     StreamPlay,
 }
 
 #[derive(Debug)]
 struct AudioPrototype {
-    synthesizer: Synthesizer,
+    synthesizer: Option<Synthesizer>,
     queue: Option<AudioQueue>,
     audio_interface_sender: Option<Sender<AudioInterfaceInput>>,
     sample_rate: Option<usize>,
@@ -60,7 +62,7 @@ struct AudioPrototype {
 impl Default for AudioPrototype {
     fn default() -> Self {
         Self {
-            synthesizer: Synthesizer::new_with(0),
+            synthesizer: Some(Synthesizer::new_with(0)),
             queue: None,
             audio_interface_sender: None,
             sample_rate: None,
@@ -83,13 +85,39 @@ impl Application for AudioPrototype {
 
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match message {
-            Message::AudioInterface(event) => self.audio_interface_update(event),
-            Message::Event(event) => self.handle_system_event(event),
-            Message::GeneratorChangeFrequency => self.synthesizer.change_frequency(),
-            Message::GeneratorPause => self.synthesizer.pause(),
-            Message::GeneratorPlay => self.synthesizer.play(),
+            Message::AudioInterface(event) => return self.audio_interface_update(event),
+            Message::Event(event) => return self.handle_system_event(event),
+            Message::SourceChangeFrequency => {
+                if let Some(s) = self.synthesizer.as_mut() {
+                    s.change_frequency()
+                }
+            }
+            Message::SourcePlay => {
+                if let Some(s) = self.synthesizer.as_mut() {
+                    s.play()
+                }
+            }
+            Message::SourcePause => {
+                if let Some(s) = self.synthesizer.as_mut() {
+                    s.pause()
+                }
+            }
             Message::StreamPause => self.audio_interface_pause(),
             Message::StreamPlay => self.audio_interface_play(),
+            Message::SourceDecreaseDelay => {
+                if let Some(s) = self.synthesizer.as_mut() {
+                    s.set_fake_delay(s.fake_delay() >> 1);
+                }
+            }
+            Message::SourceIncreaseDelay => {
+                if let Some(s) = self.synthesizer.as_mut() {
+                    s.set_fake_delay(if s.fake_delay() == 0 {
+                        1
+                    } else {
+                        s.fake_delay() << 1
+                    });
+                }
+            }
         }
         Command::none()
     }
@@ -98,19 +126,42 @@ impl Application for AudioPrototype {
         let synthesizer_card = Card::new(
             Text::new("Synthesizer"),
             Column::new()
-                .push(Button::new(Text::new("Play")).on_press(Message::GeneratorPlay))
+                .push(Button::new(Text::new("Play")).on_press(Message::SourcePlay))
                 .push(
                     Row::new()
                         .push(
                             Button::new(Text::new("Change Frequency"))
-                                .on_press(Message::GeneratorChangeFrequency),
+                                .on_press(Message::SourceChangeFrequency),
                         )
                         .push(Text::new(format!(
                             "Frequency: {:0.2} Hz",
-                            self.synthesizer.frequency()
+                            if let Some(s) = self.synthesizer.as_ref() {
+                                s.frequency()
+                            } else {
+                                0.0
+                            }
                         ))),
                 )
-                .push(Button::new(Text::new("Pause")).on_press(Message::GeneratorPause)),
+                .push(Button::new(Text::new("Pause")).on_press(Message::SourcePause))
+                .push(
+                    Row::new()
+                        .push(
+                            Button::new(Text::new("Delay +"))
+                                .on_press(Message::SourceIncreaseDelay),
+                        )
+                        .push(
+                            Button::new(Text::new("Delay -"))
+                                .on_press(Message::SourceDecreaseDelay),
+                        )
+                        .push(Text::new(format!(
+                            "Delay: {} usec",
+                            if let Some(s) = self.synthesizer.as_ref() {
+                                s.fake_delay()
+                            } else {
+                                0
+                            }
+                        ))),
+                ),
         );
         let queue_len = if let Some(queue) = &self.queue {
             queue.len()
@@ -143,17 +194,25 @@ impl Application for AudioPrototype {
     }
 }
 impl AudioPrototype {
-    fn audio_interface_update(&mut self, event: AudioInterfaceEvent) {
+    fn audio_interface_update(&mut self, event: AudioInterfaceEvent) -> Command<Message> {
         match event {
             AudioInterfaceEvent::Ready(sender) => self.audio_interface_sender = Some(sender),
             AudioInterfaceEvent::Reset(sample_rate, queue) => {
                 self.sample_rate = Some(sample_rate);
                 self.queue = Some(queue);
-                self.synthesizer = Synthesizer::new_with(sample_rate);
+                self.synthesizer = Some(Synthesizer::new_with(sample_rate));
             }
-            AudioInterfaceEvent::NeedsAudio(count) => {
+            AudioInterfaceEvent::NeedsAudio(when, count) => {
                 if let Some(queue) = &self.queue {
-                    self.synthesizer.generate_audio(count, queue.clone());
+                    if let Some(synthesizer) = self.synthesizer.as_mut() {
+                        let now = Instant::now();
+                        let _time_to_receive_event = now - when;
+                        // eprintln!(
+                        //     "Time to receive AudioInterfaceEvent::NeedsAudio: {:?}",
+                        //     _time_to_receive_event
+                        // );
+                        synthesizer.generate_audio(count, queue.clone());
+                    }
                 }
             }
             AudioInterfaceEvent::Quit => {
@@ -163,6 +222,7 @@ impl AudioPrototype {
                 // to do that.
             }
         }
+        Command::none()
     }
 
     fn audio_interface_play(&self) {
@@ -179,10 +239,12 @@ impl AudioPrototype {
         }
     }
 
-    fn handle_system_event(&mut self, event: Event) {
+    fn handle_system_event(&mut self, event: Event) -> Command<Message> {
         if let Event::Window(window::Event::CloseRequested) = event {
             self.send_to_audio_interface(AudioInterfaceInput::Quit);
+            return window::close::<Message>();
         }
+        Command::none()
     }
 }
 
@@ -190,7 +252,7 @@ pub fn main() -> iced::Result {
     AudioPrototype::run(Settings {
         exit_on_close_request: false,
         window: window::Settings {
-            size: (640, 480),
+            size: (800, 600),
             ..window::Settings::default()
         },
         ..Settings::default()

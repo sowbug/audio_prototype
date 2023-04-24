@@ -5,7 +5,7 @@ use cpal::{
 };
 use crossbeam::queue::ArrayQueue;
 use crossbeam_channel::Sender;
-use std::{fmt::Debug, result::Result::Ok, sync::Arc};
+use std::{fmt::Debug, result::Result::Ok, sync::Arc, time::Instant};
 
 #[derive(Debug, Default)]
 pub struct StereoSample {
@@ -110,15 +110,10 @@ impl AudioStream {
     ) -> anyhow::Result<(cpal::Host, cpal::Device, cpal::SupportedStreamConfig), anyhow::Error>
     {
         let host = cpal::default_host();
-
         let device = host
             .default_output_device()
             .ok_or_else(|| anyhow::Error::msg("Default output device is not available"))?;
-        println!("Output device : {}", device.name()?);
-
         let config = device.default_output_config()?;
-        println!("Default output config : {:?}", config);
-
         Ok((host, device, config))
     }
 
@@ -200,7 +195,10 @@ impl AudioStream {
         let capacity = queue.capacity();
         let len = queue.len();
         if len < capacity {
-            let _ = audio_stream_event_sender.send(AudioInterfaceEvent::NeedsAudio(capacity - len));
+            let _ = audio_stream_event_sender.send(AudioInterfaceEvent::NeedsAudio(
+                Instant::now(),
+                capacity - len,
+            ));
         }
     }
 

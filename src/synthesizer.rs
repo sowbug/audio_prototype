@@ -1,5 +1,5 @@
 use crate::stream::{AudioQueue, StereoSample};
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 #[derive(Debug)]
 pub struct Synthesizer {
@@ -8,6 +8,8 @@ pub struct Synthesizer {
 
     pub frequency: f32,
     is_playing: bool,
+
+    fake_delay: u64,
 }
 
 impl Synthesizer {
@@ -17,6 +19,8 @@ impl Synthesizer {
             sample_clock: 0,
             frequency: 440.0,
             is_playing: true,
+
+            fake_delay: 1,
         }
     }
 
@@ -46,12 +50,19 @@ impl Synthesizer {
     }
 
     pub fn generate_audio(&mut self, count: usize, queue: AudioQueue) {
+        std::thread::sleep(Duration::from_micros(self.fake_delay));
         for _ in 0..count {
-            let sample = if self.is_playing {
-                self.make_sound(self.frequency)
-            } else {
-                0.0
-            };
+            let voice_count = 8;
+            let mut sum = 0.0;
+            for i in 0..voice_count {
+                let sample = if self.is_playing {
+                    self.make_sound(self.frequency * (1.0 + (i as f32 * (1.0 / 1000.0))))
+                } else {
+                    0.0
+                };
+                sum += sample;
+            }
+            let sample = sum / voice_count as f32;
 
             // Normally we'd produce and push empty samples even if we weren't
             // playing, but for this demo it's more useful to let the queue
@@ -65,5 +76,13 @@ impl Synthesizer {
             }
             self.tick();
         }
+    }
+
+    pub fn fake_delay(&self) -> u64 {
+        self.fake_delay
+    }
+
+    pub fn set_fake_delay(&mut self, fake_delay: u64) {
+        self.fake_delay = fake_delay;
     }
 }

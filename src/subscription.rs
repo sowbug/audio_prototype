@@ -2,6 +2,7 @@ use crate::stream::{AudioQueue, AudioStream};
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
 use iced::{subscription, Subscription};
 use std::fmt::Debug;
+use std::time::Instant;
 use std::{result::Result::Ok, thread::JoinHandle};
 
 pub enum AudioInterfaceInput {
@@ -15,7 +16,7 @@ pub enum AudioInterfaceInput {
 pub enum AudioInterfaceEvent {
     Ready(Sender<AudioInterfaceInput>),
     Reset(usize, AudioQueue),
-    NeedsAudio(usize),
+    NeedsAudio(Instant, usize),
     Quit,
 }
 
